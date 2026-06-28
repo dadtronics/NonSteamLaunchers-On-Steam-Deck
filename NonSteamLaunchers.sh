@@ -535,6 +535,70 @@ fi
 #End of First Run Env_vars
 
 
+### First-Run Desktop Icon
+# Create a clickable NonSteamLaunchers icon (Desktop + application menu) so the
+# app doesn't have to be started from a terminal each time. Idempotent: only
+# (re)written when the application-menu copy is missing, so it self-heals if the
+# user deletes it. The Exec uses the same remote curl|bash one-liner as the
+# shipped NonSteamLaunchers.desktop, so it always runs the latest version.
+create_desktop_icon() {
+    local apps_dir="${logged_in_home}/.local/share/applications"
+    local desktop_dir="${logged_in_home}/Desktop"
+    local apps_file="${apps_dir}/NonSteamLaunchers.desktop"
+    local desktop_file="${desktop_dir}/NonSteamLaunchers.desktop"
+
+    # Only (re)create when the application-menu entry is missing.
+    if [[ -f "$apps_file" ]]; then
+        return 0
+    fi
+
+    if [[ "$NSL_DRY_RUN" == "1" ]]; then
+        echo "DRY RUN: would create desktop icon at $apps_file and $desktop_file"
+        return 0
+    fi
+
+    mkdir -p "$apps_dir" "$desktop_dir"
+
+    # Resolve an icon: prefer the local repo logo, then a downloaded copy, else
+    # fall back to a themed icon name that always exists in KDE.
+    local icon="applications-games"
+    local icon_dir="${logged_in_home}/.local/share/icons/hicolor/256x256/apps"
+    local icon_path="${icon_dir}/nonsteamlaunchers.png"
+    mkdir -p "$icon_dir"
+    if [[ -f "${script_dir}/logo.png" ]]; then
+        cp "${script_dir}/logo.png" "$icon_path" && icon="$icon_path"
+    elif nsl_download "$(nsl_raw_url "logo.png")" "$icon_path"; then
+        icon="$icon_path"
+    fi
+
+    # Assemble the Exec value as a single-quoted literal so the inner
+    # $(whoami)/$(eval ...) land verbatim in the .desktop instead of expanding now.
+    local exec_line='/bin/bash -c '\''export logged_in_home=$(eval echo "~$(whoami)"); curl -Ls https://raw.githubusercontent.com/moraroy/NonSteamLaunchers-On-Steam-Deck/main/NonSteamLaunchers.sh | nohup /bin/bash'\'''
+
+    local content="[Desktop Entry]
+Name=NonSteamLaunchers
+Comment=Install and manage non-Steam launchers
+Exec=${exec_line}
+Icon=${icon}
+Type=Application
+Terminal=false
+StartupNotify=true
+Categories=Game;
+"
+
+    printf '%s' "$content" > "$apps_file"
+    printf '%s' "$content" > "$desktop_file"
+    chmod +x "$apps_file" "$desktop_file"
+    # Mark trusted for KDE so it launches without a security prompt (best-effort).
+    gio set "$desktop_file" metadata::trusted true 2>/dev/null || true
+    gio set "$apps_file" metadata::trusted true 2>/dev/null || true
+    echo "Created NonSteamLaunchers desktop icon (Desktop + application menu)."
+}
+
+create_desktop_icon
+### End First-Run Desktop Icon
+
+
 ### NSL Game Scanner.py Update/Scan
 update_nsl_game_scanner() {
     folders_to_clone=('urllib3' 'vdf' 'charset_normalizer')
@@ -755,6 +819,34 @@ function CheckInstallationDirectory {
     done
 }
 
+
+# Normalize a launcher label from the main GUI list into the canonical name that
+# the uninstaller (process_uninstall_options/uninstall_launcher) matches on.
+# Installed launchers render as "<Name> ===> <path>", so strip that suffix, then
+# fix the one display-name mismatch (install shows "Ubisoft Connect", the
+# uninstaller matches "Uplay").
+normalize_uninstall_name() {
+    local name="$1"
+    name="${name%% ===> *}"
+    case "$name" in
+        "Ubisoft Connect") name="Uplay" ;;
+    esac
+    printf '%s' "$name"
+}
+
+# Return success if the given name is a browser-based web service (from
+# chrome_entries). These are created by the scanner but have no uninstall path,
+# so the select-then-uninstall flow reports them for manual removal instead.
+is_web_service() {
+    local query="$1" entry label
+    for entry in "${chrome_entries[@]}"; do
+        label="${entry#*|}"
+        if [[ "$label" == "$query" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 #Get SD Card Path
 get_sd_path() {
@@ -1175,14 +1267,27 @@ class LauncherUI(Gtk.Window):
 
         self.store_launchers = Gtk.ListStore(bool, str)
         self.store_chrome = Gtk.ListStore(bool, str)
-        for line in launcher_lines:
-            if "|" in line:
-                value,label = line.split("|",1)
-                self.store_launchers.append([value=="TRUE", label])
-        for line in chrome_lines:
-            if "|" in line:
-                value,label = line.split("|",1)
-                self.store_chrome.append([value=="TRUE", label])
+
+        def parse_rows(lines):
+            rows = []
+            for line in lines:
+                if "|" in line:
+                    value, label = line.split("|", 1)
+                    rows.append([value == "TRUE", label])
+            return rows
+
+        # Launchers: keep the "SEPARATE APP IDS" row pinned at the top, sort the
+        # rest alphabetically (case-insensitive) for the default view.
+        launcher_rows = parse_rows(launcher_lines)
+        pinned = [r for r in launcher_rows if r[1].startswith("SEPARATE APP IDS")]
+        rest = sorted((r for r in launcher_rows if not r[1].startswith("SEPARATE APP IDS")),
+                      key=lambda r: r[1].lower())
+        for row in pinned + rest:
+            self.store_launchers.append(row)
+
+        # Web services: sort alphabetically as well.
+        for row in sorted(parse_rows(chrome_lines), key=lambda r: r[1].lower()):
+            self.store_chrome.append(row)
 
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=10)
         self.add(main_box)
@@ -1204,7 +1309,9 @@ class LauncherUI(Gtk.Window):
             toggle = Gtk.CellRendererToggle()
             toggle.connect("toggled",toggle_callback)
             tree.append_column(Gtk.TreeViewColumn("Select",toggle,active=0))
-            tree.append_column(Gtk.TreeViewColumn("Name",Gtk.CellRendererText(),text=1))
+            name_col = Gtk.TreeViewColumn("Name",Gtk.CellRendererText(),text=1)
+            name_col.set_sort_column_id(1)  # click header to re-sort A-Z / Z-A
+            tree.append_column(name_col)
             return tree
 
         # Launchers Tree
@@ -1276,7 +1383,10 @@ class LauncherUI(Gtk.Window):
         website_names = self.entry_names.get_text().strip()
         websites = self.entry.get_text().strip()
 
-        if label in ["Uninstall", "Move to SD Card"]:
+        # "Uninstall" now uses the checked items as its targets (symmetric with
+        # install), so it is no longer blocked by a selection. "Move to SD Card"
+        # still requires an empty selection.
+        if label == "Move to SD Card":
             if selected_launchers or selected_chrome or selected_browser or website_names or websites:
                 dlg = Gtk.MessageDialog(
                     parent=self,
@@ -1294,8 +1404,8 @@ class LauncherUI(Gtk.Window):
 
 
 
-        # Enforce browser selection if needed
-        if (selected_chrome or websites) and not selected_browser:
+        # Enforce browser selection if needed (not when uninstalling)
+        if label != "Uninstall" and (selected_chrome or websites) and not selected_browser:
             dlg = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.WARNING,
                                     buttons=Gtk.ButtonsType.OK,
                                     text="You must select a browser if you chose a web service or entered a website.")
@@ -1337,9 +1447,35 @@ EOF
     IFS=',' read -ra custom_websites <<< "$custom_websites_str"
     IFS='|' read -ra selected_launchers <<< "$selected_launchers_str"
 
+    # Uninstall targets captured from the main window (populated below for the
+    # "Uninstall" button); initialized here so the dispatcher can always test them.
+    gui_uninstall_targets=()
+    gui_uninstall_web_services=()
+
     # Determine what to put in options:
     if [[ "$extra_button" == "OK" ]]; then
         options="$selected_launchers_str"
+    elif [[ "$extra_button" == "Uninstall" ]]; then
+        # Select-then-uninstall: treat the checked items as uninstall targets.
+        # Normalize each to its canonical uninstall name, set web services aside
+        # (no uninstall path exists for them), then reproduce the same safe state
+        # the original "Uninstall with nothing selected" used — options="Uninstall"
+        # with an empty selection — so the install logic below is a no-op and the
+        # uninstall dispatcher takes over.
+        gui_uninstall_targets=()
+        gui_uninstall_web_services=()
+        for item in "${selected_launchers[@]}"; do
+            [[ -z "$item" ]] && continue
+            [[ "$item" == "SEPARATE APP IDS"* ]] && continue
+            norm_name="$(normalize_uninstall_name "$item")"
+            if is_web_service "$norm_name"; then
+                gui_uninstall_web_services+=("$norm_name")
+            else
+                gui_uninstall_targets+=("$norm_name")
+            fi
+        done
+        selected_launchers=()
+        options="Uninstall"
     elif [[ "$selected_launchers_str" == "" ]]; then
         # Only a button was pressed, no launchers selected
         options="$extra_button"
@@ -2180,6 +2316,19 @@ uninstall_launcher() {
     shift 6
 
     if [[ $uninstall_options == *"Uninstall $launcher"* ]]; then
+        if [[ "$NSL_DRY_RUN" == "1" ]]; then
+            if [[ -f "$path1" ]]; then
+                echo "DRY RUN: would uninstall $launcher (remove $remove_path1)"
+            elif [[ -f "$path2" ]]; then
+                echo "DRY RUN: would uninstall $launcher (remove $remove_path2)"
+            else
+                echo "DRY RUN: $launcher not detected as installed; nothing to remove"
+            fi
+            for env_var_prefix in "$@"; do
+                echo "DRY RUN: would delete env vars matching '${env_var_prefix}' for $launcher"
+            done
+            return 0
+        fi
         if [[ -f "$path1" ]]; then
             rm -rf "$remove_path1"
             zenity --info --text="$launcher has been uninstalled." --width=200 --height=150 &
@@ -2496,7 +2645,27 @@ else
     # No command line arguments were provided
     # Check if the Uninstall button was clicked in the GUI
     if [[ $options == "Uninstall" ]] || [[ $selected_launchers == "Uninstall" ]]; then
-        # The Uninstall button was clicked in the GUI
+        # Select-then-uninstall: if anything was checked in the main window
+        # (launchers/browsers to remove, and/or web services to note), handle it
+        # directly and skip the Zenity picker.
+        if (( ${#gui_uninstall_targets[@]} + ${#gui_uninstall_web_services[@]} > 0 )); then
+            for name in "${gui_uninstall_targets[@]}"; do
+                process_uninstall_options "Uninstall $name"
+            done
+            if [[ ${#gui_uninstall_web_services[@]} -gt 0 ]]; then
+                zenity --info --width=420 \
+                    --text="These web-service shortcuts can't be auto-removed yet:
+
+${gui_uninstall_web_services[*]}
+
+Please remove them manually from Steam (right-click the game in your library, then Manage > Remove non-Steam game)."
+            fi
+            echo "Uninstallation completed successfully."
+            rm -rf "$download_dir"
+            exit 0
+        fi
+
+        # Fallback: Uninstall clicked with nothing pre-selected — show the picker.
         # Display the zenity window to select launchers to uninstall
         uninstall_options=$(zenity --list --checklist \
             --title="Uninstall Launchers" \
