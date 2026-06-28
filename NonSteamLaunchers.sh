@@ -547,8 +547,9 @@ create_desktop_icon() {
     local apps_file="${apps_dir}/NonSteamLaunchers.desktop"
     local desktop_file="${desktop_dir}/NonSteamLaunchers.desktop"
 
-    # Only (re)create when the application-menu entry is missing.
-    if [[ -f "$apps_file" ]]; then
+    # (Re)create whenever either copy is missing, so a deleted desktop icon comes
+    # back on the next run while leaving an existing menu entry untouched.
+    if [[ -f "$apps_file" && -f "$desktop_file" ]]; then
         return 0
     fi
 
