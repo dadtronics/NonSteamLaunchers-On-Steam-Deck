@@ -280,7 +280,20 @@ nsl_restart_steam() {
         unset WINEDLLOVERRIDES
         unset GAMEID
         unset LD_LIBRARY_PATH
-        nohup /usr/bin/steam -silent >/dev/null 2>&1 &
+        # Relaunch Steam detached from this terminal so the desktop portal stops
+        # attributing Steam's screencast / Remote Play prompts to Konsole (and
+        # re-asking on every restart). KDE resolves the portal app-id from the
+        # process cgroup, so Steam must land in its own "app-steam-*" scope --
+        # setsid alone isn't enough because the process stays in the terminal's
+        # cgroup. Prefer a systemd user scope (portal reads it as "steam" and the
+        # grant persists); fall back to setsid, then nohup.
+        if command -v systemd-run >/dev/null 2>&1; then
+            systemd-run --user --scope --unit="app-steam-$$" /usr/bin/steam -silent >/dev/null 2>&1 &
+        elif command -v setsid >/dev/null 2>&1; then
+            setsid -f /usr/bin/steam -silent >/dev/null 2>&1
+        else
+            nohup /usr/bin/steam -silent >/dev/null 2>&1 &
+        fi
     )
 }
 
